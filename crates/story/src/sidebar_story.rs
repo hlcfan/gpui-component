@@ -8,7 +8,6 @@ use gpui::{
 
 use gpui_component::{
     badge::Badge,
-    blue_500,
     breadcrumb::{Breadcrumb, BreadcrumbItem},
     context_menu::ContextMenuExt,
     divider::Divider,
@@ -19,7 +18,7 @@ use gpui_component::{
         SidebarToggleButton,
     },
     switch::Switch,
-    v_flex, white, ActiveTheme, Icon, IconName, Side, Sizable,
+    v_flex, ActiveTheme, Icon, IconName, Side, Sizable,
 };
 use serde::Deserialize;
 
@@ -271,8 +270,8 @@ impl Render for SidebarStory {
                                     .items_center()
                                     .justify_center()
                                     .rounded(cx.theme().radius)
-                                    .bg(blue_500())
-                                    .text_color(white())
+                                    .bg(cx.theme().success)
+                                    .text_color(cx.theme().success_foreground)
                                     .size_8()
                                     .flex_shrink_0()
                                     .when(!self.collapsed, |this| {
