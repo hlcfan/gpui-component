@@ -123,7 +123,7 @@ impl Render for ResizableStory {
             //   its width; the center flex panel absorbs the freed
             //   space.
             // - `Use flex_none = false`: right panel inherits the
-            //   internal `flex_grow: 1` and absorbs half of the
+            //   internal `flex_grow_1` and absorbs half of the
             //   freed slack alongside the center.
             //
             // Use the two buttons to record before/after for the same
