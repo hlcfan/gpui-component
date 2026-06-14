@@ -14,6 +14,7 @@ use ropey::Rope;
 use smallvec::SmallVec;
 use std::{ops::Range, rc::Rc};
 
+use crate::input;
 use crate::{
     ActiveTheme as _, Colorize, IconName, Root, Selectable, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -1940,6 +1941,7 @@ impl Element for TextElement {
         let bounds = prepaint.bounds;
         let selected_range = self.state.read(cx).selected_range;
         let text_align = prepaint.last_layout.text_align;
+        let disabled = self.state.read(cx).disabled;
 
         window.handle_input(
             &focus_handle,
@@ -2190,6 +2192,22 @@ impl Element for TextElement {
             window,
             cx,
         );
+
+        if disabled {
+          let gutter_width = prepaint.last_layout.line_number_width;
+          let mut overlay = cx.theme().editor_background();
+          overlay.a *= 0.5;
+          window.paint_quad(fill(
+              Bounds{
+                origin: point(input_bounds.origin.x + gutter_width, input_bounds.origin.y),
+                size: size(
+                  (input_bounds.size.width - gutter_width).max(px(0.)),
+                  input_bounds.size.height,
+                ),
+              },
+              overlay,
+          ));
+        }
 
         self.state.update(cx, |state, cx| {
             state.last_layout = Some(prepaint.last_layout.clone());

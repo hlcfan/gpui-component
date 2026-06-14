@@ -379,7 +379,9 @@ impl RenderOnce for Input {
             })
             .when(self.appearance, |this| {
                 this.bg(bg)
-                    .when(self.disabled, |this| this.opacity(0.5))
+                    .when(self.disabled && !state.mode.is_code_editor(), |this| {
+                        this.opacity(0.5)
+                    })
                     .rounded(cx.theme().radius)
                     .when(self.bordered, |this| {
                         this.border_color(cx.theme().input)
