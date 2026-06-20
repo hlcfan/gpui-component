@@ -5,13 +5,13 @@
 //! the [`super::NativeMenu`] API working on every platform.
 
 use gpui::{
-    App, Context, DismissEvent, Entity, FocusHandle, Focusable, IntoElement, ParentElement,
-    Pixels, Point, Render, Subscription, Window, anchored, deferred, div, px,
+    App, Context, DismissEvent, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Pixels,
+    Point, Render, Subscription, Window, anchored, deferred, div, px,
 };
 
+use crate::Icon;
 use crate::menu::{PopupMenu, PopupMenuItem};
 use crate::root::Root;
-use crate::Icon;
 
 use super::NativeMenuItem;
 
