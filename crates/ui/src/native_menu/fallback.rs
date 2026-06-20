@@ -82,7 +82,12 @@ fn build_popup(
                     checked: _,
                     image: Some(image),
                     action: Some(action),
-                } => menu.menu_with_icon_and_disabled(label, Icon::default().path(image), action, disabled),
+                } => menu.menu_with_icon_and_disabled(
+                    label,
+                    Icon::default().external_path(image),
+                    action,
+                    disabled,
+                ),
                 NativeMenuItem::Item {
                     label,
                     disabled,
