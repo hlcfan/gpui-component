@@ -26,7 +26,7 @@ use crate::{
 ///
 /// The menu is generic over the input it serves, so the pieces that differ
 /// between an editor and a single-line field are reached through this seam.
-pub(crate) trait CompletionMode: input::InputModeKind + Sized {
+pub(crate) trait CompletionHost: input::InputModeKind + Sized {
     fn insert_completion(
         state: &mut InputBaseState<Self>,
         item: &CompletionItem,
@@ -47,7 +47,7 @@ pub(crate) trait CompletionMode: input::InputModeKind + Sized {
     ) -> &gpui_base::input::CompletionMenuState;
 }
 
-impl CompletionMode for EditorMode {
+impl CompletionHost for EditorMode {
     fn insert_completion(
         state: &mut InputBaseState<Self>,
         item: &CompletionItem,
@@ -76,7 +76,7 @@ impl CompletionMode for EditorMode {
     }
 }
 
-impl CompletionMode for InputMode {
+impl CompletionHost for InputMode {
     fn insert_completion(
         state: &mut InputBaseState<Self>,
         item: &CompletionItem,
@@ -105,14 +105,14 @@ impl CompletionMode for InputMode {
     }
 }
 
-struct ContextMenuDelegate<M: CompletionMode> {
+struct ContextMenuDelegate<M: CompletionHost> {
     query: SharedString,
     menu: Entity<CompletionMenu<M>>,
     items: Vec<Rc<CompletionItem>>,
     selected_ix: usize,
 }
 
-impl<M: CompletionMode> ContextMenuDelegate<M> {
+impl<M: CompletionHost> ContextMenuDelegate<M> {
     fn set_items(&mut self, items: Vec<CompletionItem>) {
         self.items = items.into_iter().map(Rc::new).collect();
         self.selected_ix = 0;
@@ -210,9 +210,9 @@ impl RenderOnce for CompletionMenuItem {
     }
 }
 
-impl<M: CompletionMode> EventEmitter<DismissEvent> for ContextMenuDelegate<M> {}
+impl<M: CompletionHost> EventEmitter<DismissEvent> for ContextMenuDelegate<M> {}
 
-impl<M: CompletionMode> ListDelegate for ContextMenuDelegate<M> {
+impl<M: CompletionHost> ListDelegate for ContextMenuDelegate<M> {
     type Item = CompletionMenuItem;
 
     fn items_count(&self, _: usize, _: &gpui::App) -> usize {
@@ -251,7 +251,7 @@ impl<M: CompletionMode> ListDelegate for ContextMenuDelegate<M> {
 }
 
 /// A context menu for code completions and code actions.
-pub struct CompletionMenu<M: CompletionMode = EditorMode> {
+pub struct CompletionMenu<M: CompletionHost = EditorMode> {
     offset: usize,
     editor: WeakEntity<InputBaseState<M>>,
     list: Entity<ListState<ContextMenuDelegate<M>>>,
@@ -263,7 +263,7 @@ pub struct CompletionMenu<M: CompletionMode = EditorMode> {
     _subscriptions: Vec<Subscription>,
 }
 
-impl<M: CompletionMode> CompletionMenu<M> {
+impl<M: CompletionHost> CompletionMenu<M> {
     /// Creates a new `CompletionMenu` with the given offset and completion items.
     ///
     /// NOTE: This element should not call from EditorState::new, unless that will stack overflow.
@@ -432,7 +432,7 @@ impl<M: CompletionMode> CompletionMenu<M> {
     }
 }
 
-impl<M: CompletionMode> Render for CompletionMenu<M> {
+impl<M: CompletionHost> Render for CompletionMenu<M> {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
             return Empty.into_any_element();

@@ -5,7 +5,7 @@ use ropey::Rope;
 
 use super::{
     InputBaseState, InputModeKind,
-    popovers::{CodeActionMenu, CompletionMenu, CompletionMode, DiagnosticPopover, HoverPopover},
+    popovers::{CodeActionMenu, CompletionHost, CompletionMenu, DiagnosticPopover, HoverPopover},
     search::SearchPanel,
 };
 
@@ -375,7 +375,7 @@ impl OverlayMode for crate::input::EditorMode {
 }
 
 /// Mirrors the engine's completion state into `menu` when it changed.
-fn sync_completion<M: CompletionMode>(
+fn sync_completion<M: CompletionHost>(
     menu: &Entity<CompletionMenu<M>>,
     signature: &mut OverlaySignature,
     state: &Entity<InputBaseState<M>>,
