@@ -3297,7 +3297,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         if wrap_width_changed || wrapping_indent_changed {
             self.state.update(cx, |state, cx| {
-                state.display_map.on_layout_changed(wrap_width, cx);
+                state.set_wrap_width(wrap_width, cx);
                 state.display_map.set_wrapping_indent(wrapping_indent, cx);
             });
         }

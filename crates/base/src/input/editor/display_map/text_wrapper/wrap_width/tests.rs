@@ -3,8 +3,8 @@
 use super::super::char_widths::CharWidths;
 use super::super::monospace::MonospaceWidths;
 use super::super::{
-    GraphemeEnds, TextWrapper, WrapScratch, WrappingIndent, fast_wrap, measured_wrap,
-    measured_wrap_boundaries, monospace_wrap,
+    BACKGROUND_WRAP_MIN_BYTES, GraphemeEnds, TextWrapper, WidthPassResult, WrapScratch,
+    WrappingIndent, fast_wrap, measured_wrap, measured_wrap_boundaries, monospace_wrap,
 };
 use super::*;
 use crate::input::RopeExt as _;
@@ -842,4 +842,125 @@ fn summed_and_shaped_paths_agree_on_tabs_after_text_that_ends_on_a_stop(cx: &mut
             }
         }
     });
+}
+
+/// A large text rewraps every line for a new width in a width pass. Its rows keep the previous
+/// width until the pass is finished, and then match a cold wrap.
+#[gpui::test]
+fn a_large_text_rewraps_for_a_new_width_in_a_width_pass(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let text = large_text();
+        let mut wrapper = TextWrapper::new(font("Arial"), px(14.), Some(px(1000.)));
+        wrapper.update(&text, &(0..0), &text, cx);
+        let before = rows(&wrapper);
+
+        let pass = wrapper
+            .set_wrap_width_deferred(Some(px(300.)), cx)
+            .expect("a large text rewraps every line in a width pass");
+        assert_eq!(rows(&wrapper), before, "rows keep the previous width");
+        assert_eq!(wrapper.wrap_width(), Some(px(1000.)));
+        assert!(
+            wrapper
+                .set_wrap_width_deferred(Some(px(300.)), cx)
+                .is_none(),
+            "the width a pass is running for starts no other pass"
+        );
+
+        let result = wrapper.finish_width_pass(pass.run(), cx);
+        assert!(matches!(result, WidthPassResult::Applied));
+        assert_eq!(wrapper.wrap_width(), Some(px(300.)));
+        assert_ne!(rows(&wrapper), before);
+        assert_cold(&wrapper, cx);
+    });
+}
+
+/// An edit made while a width pass runs leaves the pass's rows out of date, so the pass runs
+/// again on the edited text.
+#[gpui::test]
+fn an_edit_during_a_width_pass_runs_the_pass_again(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let text = large_text();
+        let mut wrapper = TextWrapper::new(font("Arial"), px(14.), Some(px(1000.)));
+        wrapper.update(&text, &(0..0), &text, cx);
+        let pass = wrapper
+            .set_wrap_width_deferred(Some(px(300.)), cx)
+            .expect("a large text rewraps every line in a width pass");
+
+        let inserted = "an inserted line that wraps at the new width, word after word after word\n";
+        let mut edited = text.clone();
+        edited.replace(0..0, inserted);
+        wrapper.update(&edited, &(0..0), &Rope::from(inserted), cx);
+        let WidthPassResult::Restarted(pass) = wrapper.finish_width_pass(pass.run(), cx) else {
+            panic!("a pass over the old text must run again");
+        };
+        assert_eq!(wrapper.wrap_width(), Some(px(1000.)));
+        assert_cold(&wrapper, cx);
+
+        let result = wrapper.finish_width_pass(pass.run(), cx);
+        assert!(matches!(result, WidthPassResult::Applied));
+        assert_eq!(wrapper.wrap_width(), Some(px(300.)));
+        assert_cold(&wrapper, cx);
+    });
+}
+
+/// Setting another width while a width pass runs stops and discards the pass, including going
+/// back to the width the rows already have.
+#[gpui::test]
+fn another_width_during_a_width_pass_drops_the_pass(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let text = large_text();
+        let mut wrapper = TextWrapper::new(font("Arial"), px(14.), Some(px(1000.)));
+        wrapper.update(&text, &(0..0), &text, cx);
+        let before = rows(&wrapper);
+
+        let pass = wrapper.set_wrap_width_deferred(Some(px(300.)), cx).unwrap();
+        assert!(
+            wrapper
+                .set_wrap_width_deferred(Some(px(1000.)), cx)
+                .is_none()
+        );
+        MEASURED_LINES.with(|count| count.set(0));
+        let result = wrapper.finish_width_pass(pass.run(), cx);
+        assert!(matches!(result, WidthPassResult::Dropped));
+        assert_eq!(
+            MEASURED_LINES.with(|count| count.get()),
+            0,
+            "a dropped pass stops before wrapping"
+        );
+        assert_eq!(wrapper.wrap_width(), Some(px(1000.)));
+        assert_eq!(rows(&wrapper), before);
+
+        let pass = wrapper.set_wrap_width_deferred(Some(px(300.)), cx).unwrap();
+        wrapper.set_wrap_width(Some(px(500.)), cx);
+        let result = wrapper.finish_width_pass(pass.run(), cx);
+        assert!(matches!(result, WidthPassResult::Dropped));
+        assert_eq!(wrapper.wrap_width(), Some(px(500.)));
+        assert_cold(&wrapper, cx);
+    });
+}
+
+/// A text below the background size rewraps right away.
+#[gpui::test]
+fn a_small_text_rewraps_for_a_new_width_at_once(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let text = Rope::from(large_text().slice(0..4096).to_string());
+        let mut wrapper = TextWrapper::new(font("Arial"), px(14.), Some(px(1000.)));
+        wrapper.update(&text, &(0..0), &text, cx);
+
+        assert!(
+            wrapper
+                .set_wrap_width_deferred(Some(px(300.)), cx)
+                .is_none()
+        );
+        assert_eq!(wrapper.wrap_width(), Some(px(300.)));
+        assert_cold(&wrapper, cx);
+    });
+}
+
+/// Lines that fit on one row at 1000px and wrap at narrower widths, past the size that
+/// rewraps on a background thread.
+fn large_text() -> Rope {
+    let line = "word after word after word after word after word after word after word after word";
+    let lines = BACKGROUND_WRAP_MIN_BYTES / line.len() + 1;
+    Rope::from(vec![line; lines].join("\n"))
 }

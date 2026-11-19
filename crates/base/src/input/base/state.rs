@@ -8,7 +8,7 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
     Render, ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, UTF16Selection, WeakFocusHandle, Window, actions, div, point,
+    Subscription, Task, UTF16Selection, WeakFocusHandle, Window, actions, div, point,
     prelude::FluentBuilder as _, px,
 };
 use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
@@ -28,6 +28,7 @@ use super::{
     blink_cursor::BlinkCursor,
     change::Change,
     cursor::{CursorSelection, Selections},
+    display_map::{WidthPass, WidthPassResult},
     element::{
         EditorScrollbar, EditorScrollbarSnapshot, LongestLineKey, OverviewRulerRows, TextElement,
         clamp_horizontal_scroll_offset, line_number_digits_width, line_number_len,
@@ -442,6 +443,8 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) mode: LayoutMode,
     pub(super) text: Rope,
     pub(super) display_map: DisplayMap,
+    /// Rewraps a large text at a new width on a background thread.
+    wrap_width_task: Option<Task<()>>,
     pub(super) undo_manager: UndoManager,
     pub(super) inline_tokens: Option<Box<super::inline_tokens::InlineTokenStore>>,
     pub(super) pending_token: Option<super::InlineToken>,
@@ -982,6 +985,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             selection_focus: None,
             text: "".into(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
+            wrap_width_task: None,
             search_session: super::SearchSession::default(),
             search_activation_revision: 0,
             searchable: false,
@@ -4314,12 +4318,42 @@ impl<M: InputModeKind> InputBaseState<M> {
                     last_layout.wrap_width
                 };
 
-                self.display_map.on_layout_changed(wrap_width, cx);
+                self.set_wrap_width(wrap_width, cx);
                 if self.is_multi_line() {
                     self.mode.update_auto_grow(&self.display_map);
                 }
                 cx.notify();
             }
+        }
+    }
+
+    /// Wrap the text at `wrap_width`. A large text rewraps every line on a background thread
+    /// and keeps its previous rows until that is done.
+    pub(super) fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut Context<Self>) {
+        let pass = self.display_map.on_layout_changed_deferred(wrap_width, cx);
+        if let Some(pass) = pass {
+            self.run_width_pass(pass, cx);
+        }
+    }
+
+    fn run_width_pass(&mut self, pass: WidthPass, cx: &mut Context<Self>) {
+        let finished = cx.background_spawn(async move { pass.run() });
+        self.wrap_width_task = Some(cx.spawn(async move |this, cx| {
+            let pass = finished.await;
+            _ = this.update(cx, |state, cx| state.finish_width_pass(pass, cx));
+        }));
+    }
+
+    fn finish_width_pass(&mut self, pass: WidthPass, cx: &mut Context<Self>) {
+        match self.display_map.finish_width_pass(pass, cx) {
+            WidthPassResult::Applied => {
+                if self.is_multi_line() {
+                    self.mode.update_auto_grow(&self.display_map);
+                }
+                cx.notify();
+            }
+            WidthPassResult::Restarted(pass) => self.run_width_pass(*pass, cx),
+            WidthPassResult::Dropped => {}
         }
     }
 
@@ -11198,6 +11232,34 @@ mod tests {
                 state.select_to_end_of_line(&SelectToEndOfLine, window, cx);
                 assert_eq!(state.selected_range(), boundary..state.text.len());
             });
+        });
+    }
+
+    /// A large text keeps its rows while it rewraps for a new width on a background thread,
+    /// and adopts the new rows once that is done, including the width its layout picks.
+    #[gpui::test]
+    fn a_large_text_rewraps_for_a_new_width_in_the_background(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let narrow_rows = cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                let line = "word after word after word after word after word after word\n";
+                state.set_value(line.repeat(8 * 1024), window, cx);
+                state.display_map.on_layout_changed(Some(px(100.)), cx);
+                let rows = state.display_map.display_row_count();
+                state.set_wrap_width(Some(px(300.)), cx);
+                assert_eq!(state.display_map.wrap_width(), Some(px(100.)));
+                assert_eq!(state.display_map.display_row_count(), rows);
+                rows
+            })
+        });
+
+        cx.run_until_parked();
+        view.input.read_with(&cx, |state, _| {
+            let layout_width = state.last_layout.as_ref().unwrap().wrap_width;
+            assert!(layout_width.is_some_and(|width| width > px(300.)));
+            assert_eq!(state.display_map.wrap_width(), layout_width);
+            assert!(state.display_map.display_row_count() < narrow_rows);
         });
     }
 

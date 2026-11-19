@@ -6,7 +6,7 @@
 //! shaped run. A lookup must reproduce the shaped widths bit for bit, or a break could move, so a
 //! font is only used here after its shaped widths have been checked against the table.
 
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc};
 
 use gpui::{App, Font, Global, Pixels, px};
 
@@ -90,13 +90,13 @@ impl MonospaceWidths {
         glyph_starts: impl FnMut(&str) -> Vec<Pixels>,
         measure: impl FnMut(&str) -> Pixels,
         cx: &mut App,
-    ) -> Option<Rc<Self>> {
+    ) -> Option<Arc<Self>> {
         let key = (font.clone(), f32::from(font_size).to_bits());
         let cache = cx.default_global::<MonospaceCache>();
         cache
             .0
             .entry(key)
-            .or_insert_with(|| Self::detect(glyph_starts, measure).map(Rc::new))
+            .or_insert_with(|| Self::detect(glyph_starts, measure).map(Arc::new))
             .clone()
     }
 
@@ -109,7 +109,7 @@ impl MonospaceWidths {
 
 /// Results of [`MonospaceWidths::detect`] by font and font size bits.
 #[derive(Default)]
-struct MonospaceCache(HashMap<(Font, u32), Option<Rc<MonospaceWidths>>>);
+struct MonospaceCache(HashMap<(Font, u32), Option<Arc<MonospaceWidths>>>);
 
 impl Global for MonospaceCache {}
 

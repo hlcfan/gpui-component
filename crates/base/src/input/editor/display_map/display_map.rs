@@ -12,7 +12,7 @@ use ropey::Rope;
 use super::fold_map::FoldMap;
 use super::folding::FoldRange;
 pub use super::text_wrapper::WrappingIndent;
-use super::text_wrapper::{LineItem, WrapDisplayPoint};
+use super::text_wrapper::{LineItem, WidthPass, WidthPassResult, WrapDisplayPoint};
 use super::wrap_map::WrapMap;
 use super::{BufferPoint, DisplayPoint};
 use crate::input::Point as TreeSitterPoint;
@@ -238,6 +238,28 @@ impl DisplayMap {
     pub fn on_layout_changed(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
         self.wrap_map.on_layout_changed(wrap_width, cx);
         self.rebuild_fold_projection();
+    }
+
+    /// [`Self::on_layout_changed`], except that rewrapping every line of a large text is
+    /// returned as a [`WidthPass`] to run on a background thread and hand to
+    /// [`Self::finish_width_pass`]. Until then the rows keep the previous width.
+    pub(crate) fn on_layout_changed_deferred(
+        &mut self,
+        wrap_width: Option<Pixels>,
+        cx: &mut App,
+    ) -> Option<WidthPass> {
+        let pass = self.wrap_map.on_layout_changed_deferred(wrap_width, cx);
+        self.rebuild_fold_projection();
+        pass
+    }
+
+    /// Adopt the rows of a finished [`WidthPass`] if they still match the text.
+    pub(crate) fn finish_width_pass(&mut self, pass: WidthPass, cx: &mut App) -> WidthPassResult {
+        let result = self.wrap_map.finish_width_pass(pass, cx);
+        if matches!(result, WidthPassResult::Applied) {
+            self.rebuild_fold_projection();
+        }
+        result
     }
 
     /// Set the wrapping indent for continuation lines.

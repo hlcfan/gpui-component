@@ -8,8 +8,11 @@ use gpui::Half;
 use measurements::WidthMeasurements;
 use monospace::{MonospaceWidths, is_printable_ascii};
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wrap_width::{MeasuredWrap, WidthRange};
 
 use gpui::{
@@ -382,6 +385,108 @@ enum Reuse {
 /// Rewrapping only the stale runs pays off while at most one row in this many is stale.
 const ROWS_PER_STALE_ROW: usize = 64;
 
+/// Texts at least this large rewrap every line for a new width on a background thread, so a
+/// window resize does not stall a frame on it.
+const BACKGROUND_WRAP_MIN_BYTES: usize = 256 * 1024;
+
+/// A rewrap of every line at a new width, detached from the app so it can run on a background
+/// thread. Made by [`TextWrapper::set_wrap_width_deferred`].
+pub(crate) struct WidthPass {
+    wrapper: TextWrapper,
+    text_system: Arc<gpui::TextSystem>,
+    /// The source wrapper's revision when the pass started.
+    revision: usize,
+}
+
+impl WidthPass {
+    /// Wrap every line, keeping the rows of lines whose breaks hold at the new width.
+    pub(crate) fn run(mut self) -> Self {
+        let text = self.wrapper.text.clone();
+        self.wrapper.wrap_ranges(
+            &self.text_system,
+            &text,
+            &[(0..text.len(), text.clone())],
+            Reuse::Widths,
+        );
+        self
+    }
+}
+
+/// What [`TextWrapper::finish_width_pass`] did with a finished [`WidthPass`].
+pub(crate) enum WidthPassResult {
+    /// The rows now use the pass's width.
+    Applied,
+    /// The text or settings changed while it ran, so this pass must run again.
+    Restarted(Box<WidthPass>),
+    /// Another width was set while it ran, so its rows were discarded.
+    Dropped,
+}
+
+/// Free `lines` on a background thread, since freeing every row of a large text takes
+/// milliseconds.
+fn free_in_background(lines: SumTree<LineItem>, cx: &App) {
+    cx.background_executor()
+        .spawn(async move { drop(lines) })
+        .detach();
+}
+
+/// Shapes text in one font, for measuring it.
+struct Shaper {
+    text_system: gpui::WindowTextSystem,
+    font: Font,
+    font_size: Pixels,
+    /// The width of one tab stop, so tabs are measured as they are drawn.
+    tab_stop: Pixels,
+}
+
+impl Shaper {
+    fn new(
+        text_system: &Arc<gpui::TextSystem>,
+        font: &Font,
+        font_size: Pixels,
+        tab_size: usize,
+    ) -> Self {
+        let text_system = gpui::WindowTextSystem::new(text_system.clone());
+        let tab_stop = tab_stop_width(&text_system, font, font_size, tab_size);
+        Self {
+            text_system,
+            font: font.clone(),
+            font_size,
+            tab_stop,
+        }
+    }
+
+    /// The drawn width of `text`, tabs expanded.
+    fn width(&self, text: &str) -> Pixels {
+        expanded_width(&self.layout(text), text, self.tab_stop)
+    }
+
+    /// The x position of every glyph of `text`, followed by its width.
+    fn glyph_starts(&self, text: &str) -> Vec<Pixels> {
+        let layout = self.layout(text);
+        let glyphs = layout.runs.iter().flat_map(|run| &run.glyphs);
+        let mut starts: Vec<Pixels> = glyphs.map(|glyph| glyph.position.x).collect();
+        starts.push(layout.width);
+        starts
+    }
+
+    fn layout(&self, text: &str) -> Arc<gpui::LineLayout> {
+        self.text_system.layout_line(
+            text,
+            self.font_size,
+            &[gpui::TextRun {
+                len: text.len(),
+                font: self.font.clone(),
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        )
+    }
+}
+
 /// A line with soft wrapped lines info.
 #[derive(Debug, Clone)]
 pub(crate) struct LineItem {
@@ -516,17 +621,26 @@ pub(crate) struct TextWrapper {
     /// The lines by split \n
     pub(crate) lines: SumTree<LineItem>,
 
-    inline_metrics: Rc<[(Range<usize>, Pixels)]>,
+    inline_metrics: Arc<[(Range<usize>, Pixels)]>,
     /// Exact native widths avoid reshaping the same prefix when a drag crosses wrap thresholds.
-    width_measurements: Rc<std::cell::RefCell<WidthMeasurements>>,
+    width_measurements: WidthMeasurements,
     /// Whether the font measures printable ASCII by lookup; `None` until first needed.
-    monospace: Option<Option<Rc<MonospaceWidths>>>,
+    monospace: Option<Option<Arc<MonospaceWidths>>>,
     scratch: WrapScratch,
     char_widths: CharWidths,
     /// Lets tests compare the summed-width path with the shaped one.
     #[cfg(test)]
     fast_non_ascii: bool,
     _initialized: bool,
+    /// Counts changes to `text` and `lines`, so a [`WidthPass`] can tell whether its rows still
+    /// match.
+    revision: usize,
+    /// The width a running [`WidthPass`] wraps at, while `lines` keep the previous width.
+    pending_wrap_width: Option<Pixels>,
+    /// Set to stop the running [`WidthPass`] once its rows can no longer be used.
+    running_pass: Option<Arc<AtomicBool>>,
+    /// In a [`WidthPass`]'s own wrapper, stops it between lines when set.
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 #[allow(unused)]
@@ -540,14 +654,18 @@ impl TextWrapper {
             wrapping_indent: WrappingIndent::default(),
             tab_size: TabSize::default().tab_size,
             lines: SumTree::new(&()),
-            inline_metrics: Rc::from([]),
-            width_measurements: Rc::default(),
+            inline_metrics: Arc::from([]),
+            width_measurements: WidthMeasurements::default(),
             monospace: None,
             scratch: WrapScratch::default(),
             char_widths: CharWidths::default(),
             #[cfg(test)]
             fast_non_ascii: true,
             _initialized: false,
+            revision: 0,
+            pending_wrap_width: None,
+            running_pass: None,
+            cancelled: None,
         }
     }
 
@@ -560,6 +678,8 @@ impl TextWrapper {
     #[inline]
     pub(crate) fn set_default_text(&mut self, text: &Rope) {
         self.text = text.clone();
+        self.revision += 1;
+        self.cancel_running_pass();
     }
 
     /// Get reference to the rope text.
@@ -639,27 +759,78 @@ impl TextWrapper {
     /// Ignored when the text is not wrapped.
     pub(crate) fn prepare_wrap_width(&mut self, wrap_width: Pixels) {
         if self.wrap_width.is_some() {
+            self.drop_width_pass();
             self.wrap_width = Some(wrap_width);
         }
     }
 
     pub(crate) fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut App) {
+        self.drop_width_pass();
+        self.apply_wrap_width(wrap_width, false, cx);
+    }
+
+    /// [`Self::set_wrap_width`], except that rewrapping every line of a large text is left to
+    /// the returned [`WidthPass`], to run on a background thread and hand to
+    /// [`Self::finish_width_pass`]. Until then the rows keep the previous width.
+    pub(crate) fn set_wrap_width_deferred(
+        &mut self,
+        wrap_width: Option<Pixels>,
+        cx: &mut App,
+    ) -> Option<WidthPass> {
+        if wrap_width.is_some() && wrap_width == self.pending_wrap_width {
+            return None;
+        }
+        self.drop_width_pass();
+        let defer = self.text.len() >= BACKGROUND_WRAP_MIN_BYTES;
+        let width = self.apply_wrap_width(wrap_width, defer, cx)?;
+        self.pending_wrap_width = Some(width);
+        Some(self.width_pass(width, cx))
+    }
+
+    /// Stop waiting for the running [`WidthPass`], and tell it to stop.
+    fn drop_width_pass(&mut self) {
+        self.pending_wrap_width = None;
+        self.cancel_running_pass();
+    }
+
+    /// Tell the running [`WidthPass`] to stop, since its rows will not be used. A pending width
+    /// is kept, so [`Self::finish_width_pass`] runs the pass again.
+    fn cancel_running_pass(&mut self) {
+        if let Some(cancelled) = self.running_pass.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Wrap at `wrap_width`. With `defer`, a width-only change is not wrapped here; the width
+    /// is returned instead and the rows are left as they are. Finding the stale rows of a large
+    /// text is itself too slow for a frame, and the pass keeps the rows that stay valid.
+    fn apply_wrap_width(
+        &mut self,
+        wrap_width: Option<Pixels>,
+        defer: bool,
+        cx: &mut App,
+    ) -> Option<Pixels> {
         if wrap_width == self.wrap_width {
-            return;
+            return None;
         }
 
         let width_only = self.wrap_width.is_some() && wrap_width.is_some();
-        self.wrap_width = wrap_width;
         let text = self.text.clone();
         let Some(width) = wrap_width.filter(|_| width_only) else {
+            self.wrap_width = wrap_width;
             self.update_wrapped(&text, &(0..text.len()), &text, Reuse::Nothing, cx);
-            return;
+            return None;
         };
         if self.lines.summary().valid_widths.contains(width) {
-            return;
+            self.wrap_width = wrap_width;
+            return None;
+        }
+        if defer {
+            return Some(width);
         }
         match self.stale_rows(width) {
             Some(stale_rows) => {
+                self.wrap_width = wrap_width;
                 let edits: Vec<(Range<usize>, Rope)> = stale_rows
                     .into_iter()
                     .map(|rows| {
@@ -670,9 +841,77 @@ impl TextWrapper {
                     })
                     .collect();
                 self.update_wrapped_ranges(&text, &edits, Reuse::Measurements, cx);
+                None
             }
-            None => self.update_wrapped(&text, &(0..text.len()), &text, Reuse::Widths, cx),
+            None => {
+                self.wrap_width = wrap_width;
+                self.update_wrapped(&text, &(0..text.len()), &text, Reuse::Widths, cx);
+                None
+            }
         }
+    }
+
+    /// A copy of this wrapper that rewraps every line at `width` without the app, taking the
+    /// measurement caches along.
+    fn width_pass(&mut self, width: Pixels, cx: &mut App) -> WidthPass {
+        self.prepare_monospace(cx);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.running_pass = Some(cancelled.clone());
+        let wrapper = TextWrapper {
+            text: self.text.clone(),
+            font: self.font.clone(),
+            font_size: self.font_size,
+            wrap_width: Some(width),
+            wrapping_indent: self.wrapping_indent,
+            tab_size: self.tab_size,
+            lines: self.lines.clone(),
+            inline_metrics: self.inline_metrics.clone(),
+            width_measurements: std::mem::take(&mut self.width_measurements),
+            monospace: self.monospace.clone(),
+            scratch: WrapScratch::default(),
+            char_widths: std::mem::take(&mut self.char_widths),
+            #[cfg(test)]
+            fast_non_ascii: self.fast_non_ascii,
+            _initialized: true,
+            revision: 0,
+            pending_wrap_width: None,
+            running_pass: None,
+            cancelled: Some(cancelled),
+        };
+        WidthPass {
+            wrapper,
+            text_system: cx.text_system().clone(),
+            revision: self.revision,
+        }
+    }
+
+    /// Adopt the rows of a finished `pass` when the text and settings are what it started
+    /// from. When they changed but its width is still wanted, returns a new pass to run.
+    pub(crate) fn finish_width_pass(&mut self, pass: WidthPass, cx: &mut App) -> WidthPassResult {
+        let WidthPass {
+            wrapper: pass,
+            revision,
+            ..
+        } = pass;
+        let Some(width) = self
+            .pending_wrap_width
+            .filter(|&width| pass.wrap_width == Some(width))
+        else {
+            free_in_background(pass.lines, cx);
+            return WidthPassResult::Dropped;
+        };
+        if revision != self.revision {
+            free_in_background(pass.lines, cx);
+            return WidthPassResult::Restarted(Box::new(self.width_pass(width, cx)));
+        }
+        self.pending_wrap_width = None;
+        self.running_pass = None;
+        self.wrap_width = Some(width);
+        free_in_background(std::mem::replace(&mut self.lines, pass.lines), cx);
+        self.width_measurements = pass.width_measurements;
+        self.char_widths = pass.char_widths;
+        self.revision += 1;
+        WidthPassResult::Applied
     }
 
     /// Runs of buffer rows whose breaks change at `wrap_width`, or `None` when there are so many
@@ -792,55 +1031,51 @@ impl TextWrapper {
         reuse: Reuse,
         cx: &mut App,
     ) {
+        // Only wrapping measures text, so an unwrapped editor never pays for the detection.
+        if self.wrap_width.is_some() {
+            self.prepare_monospace(cx);
+        }
+        self.wrap_ranges(cx.text_system(), changed_text, edits, reuse);
+    }
+
+    /// Detect once whether the font measures printable ASCII by lookup, which needs the app.
+    fn prepare_monospace(&mut self, cx: &mut App) {
+        if self.monospace.is_some() {
+            return;
+        }
+        let shaper = Shaper::new(cx.text_system(), &self.font, self.font_size, self.tab_size);
+        self.monospace = Some(MonospaceWidths::cached(
+            &self.font,
+            self.font_size,
+            |text| shaper.glyph_starts(text),
+            |text| shaper.width(text),
+            cx,
+        ));
+    }
+
+    /// [`Self::update_wrapped_ranges`] once the monospace detection is done, so it can run on
+    /// any thread.
+    fn wrap_ranges(
+        &mut self,
+        text_system: &Arc<gpui::TextSystem>,
+        changed_text: &Rope,
+        edits: &[(Range<usize>, Rope)],
+        reuse: Reuse,
+    ) {
         debug_assert!(reuse != Reuse::Widths || edits.len() == 1);
-        let mut line_wrapper = cx
-            .text_system()
-            .line_wrapper(self.font.clone(), self.font_size);
+        let mut line_wrapper = text_system.line_wrapper(self.font.clone(), self.font_size);
         let metrics = self.inline_metrics.clone();
-        let measurements = self.width_measurements.clone();
+        let measurements = RefCell::new(std::mem::take(&mut self.width_measurements));
         if reuse == Reuse::Nothing {
             measurements.borrow_mut().clear();
         }
-        let text_system = gpui::WindowTextSystem::new(cx.text_system().clone());
-        let font = self.font.clone();
-        let font_size = self.font_size;
+        let shaper = Shaper::new(text_system, &self.font, self.font_size, self.tab_size);
         let wrapping_indent = self.wrapping_indent;
-        let tab_stop = tab_stop_width(&text_system, &font, font_size, self.tab_size);
-        let layout = |text: &str| {
-            text_system.layout_line(
-                text,
-                font_size,
-                &[gpui::TextRun {
-                    len: text.len(),
-                    font: font.clone(),
-                    color: gpui::black(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            )
-        };
-        let shaped = |text: &str| expanded_width(&layout(text), text, tab_stop);
+        let tab_stop = shaper.tab_stop;
+        let shaped = |text: &str| shaper.width(text);
         let cached = |text: &str| measurements.borrow_mut().measure(text, || shaped(text));
-        let glyph_starts = |text: &str| {
-            let layout = layout(text);
-            let glyphs = layout.runs.iter().flat_map(|run| &run.glyphs);
-            let mut starts: Vec<Pixels> = glyphs.map(|glyph| glyph.position.x).collect();
-            starts.push(layout.width);
-            starts
-        };
-        // Only wrapping measures text, so an unwrapped editor never pays for the detection.
+        let glyph_starts = |text: &str| shaper.glyph_starts(text);
         let monospace = if self.wrap_width.is_some() {
-            if self.monospace.is_none() {
-                self.monospace = Some(MonospaceWidths::cached(
-                    &font,
-                    font_size,
-                    glyph_starts,
-                    shaped,
-                    cx,
-                ));
-            }
             self.monospace.clone().flatten()
         } else {
             None
@@ -922,6 +1157,7 @@ impl TextWrapper {
             );
         }
         drop(wrap_line);
+        self.width_measurements = measurements.into_inner();
         scratch.release_excess();
         self.scratch = scratch;
         char_widths.release_excess();
@@ -955,7 +1191,7 @@ impl TextWrapper {
         metrics: Rc<[(Range<usize>, Pixels)]>,
         cx: &mut App,
     ) {
-        if self.inline_metrics == metrics {
+        if *self.inline_metrics == *metrics {
             return;
         }
         // Only rows whose element geometry changed need another wrap pass.
@@ -985,7 +1221,7 @@ impl TextWrapper {
                 (None, None) => break,
             }
         }
-        self.inline_metrics = metrics;
+        self.inline_metrics = Arc::from(&*metrics);
         let text = self.text.clone();
         let mut rows: Vec<usize> = affected
             .iter()
@@ -1057,6 +1293,13 @@ impl TextWrapper {
         let mut lines = LinesFrom::new(changed_text, new_start_row);
         // line not contains `\n`.
         for _ in new_start_row..=new_end_row {
+            if self
+                .cancelled
+                .as_ref()
+                .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+            {
+                return;
+            }
             let (line_start, line_str) = lines
                 .next()
                 .unwrap_or((changed_text.len(), Cow::Borrowed("")));
@@ -1138,6 +1381,8 @@ impl TextWrapper {
         }
 
         self.text = changed_text.clone();
+        self.revision += 1;
+        self.cancel_running_pass();
     }
 
     /// Update the text wrapper and recalculate the wrapped lines.
